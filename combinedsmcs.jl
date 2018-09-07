@@ -1,3 +1,5 @@
+module abcsmcs
+
 using PyPlot
 using Distributions
 using LinearAlgebra
@@ -31,14 +33,37 @@ function gaussian_2D_level_curve(mu::Array{Float64,1}, sigma::Array{Float64, 2},
     return coods
 end
 
-function plot_is_vs_target(S, W; ax=Nothing, kwargs...)
-    rgba_colors = zeros(size(S, 1), 4)
-    rgba_colors[:, 3] .= 1.0   # blue
+cols_tab10 = [ 0.1216  0.4667  0.7059  1. ;
+		       1.      0.498   0.0549  1. ;
+		       0.1725  0.6275  0.1725  1. ;
+		       0.8392  0.1529  0.1569  1. ;
+		       0.5804  0.4039  0.7412  1. ;
+		       0.549   0.3373  0.2941  1. ;
+		       0.8902  0.4667  0.7608  1. ;
+		       0.498   0.498   0.498   1. ;
+		       0.7373  0.7412  0.1333  1. ;
+		       0.0902  0.7451  0.8118  1. ]
+
+cols_Blues =   [0.9317  0.9607  0.9882  1.    ;
+			    0.8525  0.9095  0.9626  1.    ;
+			    0.7752  0.8583  0.9368  1.    ;
+			    0.6522  0.806   0.8938  1.    ;
+			    0.498   0.7254  0.8561  1.    ;
+			    0.3566  0.6393  0.8146  1.    ;
+			    0.2319  0.5457  0.7626  1.    ;
+			    0.1271  0.4402  0.7075  1.    ;
+			    0.0502  0.3418  0.6306  1.    ;
+			    0.0314  0.237   0.4919  1.    ]
+
+function plot_is_vs_target(S, W; ax=Nothing, c_num=1, cm="tab10", kwargs...)
+	@assert cm == "tab10" || cm == "Blues"
+	col_matrix = cm == "tab10" ? cols_tab10 : cols_Blues
+	rgba_colors = repeat(col_matrix[c_num:c_num,:], size(S, 1), 1)
     rgba_colors[:, 4] = W/maximum(W)   # alpha
 #     print(rgba_colors)
     ax = ax==Nothing ? gca() : ax
 #     plot_level_curves_all(mus, UTs; ax=ax)
-    ax[:scatter](splat(S)..., c=rgba_colors)
+    ax[:scatter](splat(S)..., c=rgba_colors, kwargs...)
 end
 
 eye(d) = Matrix(I, d, d)
@@ -52,9 +77,45 @@ macro noopwhen(condition, expression)
     end |> esc
 end
 
-function multinomial_indices(n::Int, p::Vector{Float64})
-    # adapted from Distributions.jl/src/samplers/multinomial.jl
+# function multinomial_indices(n::Int, p::Vector{Float64})
+#     # adapted from Distributions.jl/src/samplers/multinomial.jl
     
+#     k = length(p)
+#     rp = 1.0  # remaining total probability
+#     i = 0
+#     km1 = k - 1
+#     x = zeros(Int32, n)
+#     op_ix = 1
+    
+#     while i < km1 && n > 0
+#         i += 1
+#         @inbounds pi = p[i]
+#         if pi < rp            
+#             xi = rand(Binomial(n, pi / rp))
+#             x[op_ix:(op_ix+xi-1)] .= i
+#             op_ix += xi
+#             n -= xi
+#             rp -= pi
+#         else 
+#             # In this case, we don't even have to sample
+#             # from Binomial. Just assign remaining counts
+#             # to xi. 
+#             x[op_ix:(op_ix+n-1)] .= i
+#             n = 0
+#         end
+#     end
+
+#     if i == km1
+#         x[op_ix:end] .= i+1
+#     end
+
+#     return x  
+# end
+
+
+function multinomial_indices(n::Int, p::Vector{T}) where T <: AbstractFloat
+    # adapted from Distributions.jl/src/samplers/multinomial.jl
+    # Useful if taking perhaps 20+ multinomial draws
     k = length(p)
     rp = 1.0  # remaining total probability
     i = 0
@@ -88,8 +149,44 @@ function multinomial_indices(n::Int, p::Vector{Float64})
 end
 
 
+function multinomial_indices_binsearch(n::Int, p::Vector{T}) where T <: AbstractFloat
+	# Useful if taking perhaps 10 multinomial draws
+	x = zeros(Int32, n)
+	cump = cumsum(p)
+	for i in 1:n
+		x[i] = searchsortedfirst(cump, rand()*cump[end])
+	end
+	return x
+end
+
+
+
+function multinomial_indices_linear(n::Int, p::Vector{T}) where T <: AbstractFloat
+	# Useful if taking 1-3 multinomial draws
+    m = length(p)
+    x = zeros(Int32, n)
+    
+    function linearsearch(p::Vector{T}, m::Int64, rn::T) where T <: AbstractFloat
+        cs = 0.0
+        for ii in 1:m
+            @inbounds cs += p[ii]
+            if cs > rn
+                return ii
+            end
+        end
+        return m
+    end
+        
+    for i in 1:n
+        rn = rand()
+        @inbounds x[i] = linearsearch(p, m, rn)
+    end
+    return x
+end
+
+
 ### MULTINOMIAL SAMPLING FROM A LOG PROBABILITY VECTOR
-function smp_from_logprob(n_samples::Int, logp::Vector{Float64})
+function smp_from_logprob(n_samples::Int, logp::Vector{T}) where T <: AbstractFloat
     p = exp.(logp .- maximum(logp))
     p /= sum(p)
     return multinomial_indices(n_samples, p)
@@ -380,7 +477,7 @@ function gmm_prior_llh(pis, mus, sigmas, pi_prior, mu_prior, cov_prior)
     ν = pi_prior # alias
     k = length(pis)
     out = zeros(k)
-    for j = 1:k
+    @views for j = 1:k
         out[j] += logpdf(MvNormal(mu_prior[j,:], sigmas[:,:,j]/ν[j]), mus[j,:])
         out[j] += -(ν[j] + d + 1)*logdet(sigmas[:,:,j])/2 
         out[j] += -ν[j]*sum(diag(cov_prior[:,:,j]*inv(sigmas[:,:,j])))/2
@@ -460,7 +557,7 @@ function gmm_custom(X, weights, pi_prior, mu_prior, cov_prior; max_iter=100, tol
         _mus ./= vec(Ns[active_ixs] + pi_prior[active_ixs])
         mus[active_ixs,:] = _mus
         
-        for j in findall(active_ixs)
+        @views for j in findall(active_ixs)
             Δx = X .- mus[j, :]'
             Δμ = (mus[j,:] - mu_prior[j,:])'
             sigmas[:,:,j] = (Δx.*rs[:,j])'Δx + pi_prior[j]*(Δμ'Δμ + cov_prior[:,:,j])
@@ -490,7 +587,16 @@ function sample_from_gmm(n, pis, mus, covs; shuffle=true)
 end
 
 
-function AMIS(S, W, k, log_f; epochs=5, nodisp=true)
+@with_kw struct amis_opt
+    epochs::Int64 = 5 
+    nodisp::Bool = true
+    gmm_smps::Int64 = 1000
+end
+
+
+
+function AMIS(S, W, k, log_f; kwargs...)
+	@unpack_amis_opt amis_opt(kwargs...)
     IS_tilt = 2.0
     n, p = size(S)
     
@@ -505,32 +611,45 @@ function AMIS(S, W, k, log_f; epochs=5, nodisp=true)
         cmus[i,:] = cX' * cw/cw.sum
         ccovs[:,:,i] = cov(cX, cw, corrected=true)
     end
-    cpis = [countmap(km.assignments)[i] for i in 1:6]/10
+
+    cpis = zeros(k)
+    cnts = countmap(km.assignments)
+    for i in 1:k
+    	try
+    		cpis[i] = cnts[i]/10
+    	catch e
+    		@warn "Cluster $i has no assigned points."
+    	end
+    end
     
     if !nodisp
         f, axs = PyPlot.subplots(5,3, figsize=(8,12))
+        plot_is_vs_target(S, W, ax=axs[1,1])
 
 #         plot_level_curves_all(mus, UTs, ax=axs[1,1], color="red")
         for i = 1:k
-            axs[1,1][:plot](splat(gaussian_2D_level_curve(cmus[i,:], ccovs[:,:,i]))...);
+            axs[1,2][:plot](splat(gaussian_2D_level_curve(cmus[i,:], ccovs[:,:,i]))...);
         end
     end
     
     ν_S = S; ν_W = W;
     end
     
-    nsmp=1000
+    nsmp = gmm_smps
     
     for i = 1:epochs
         cpis, cmus, ccovs = gmm_custom(ν_S, ν_W, cpis, cmus, ccovs; max_iter=3, tol=1e-3, verbose=false);
         ν_S = sample_from_gmm(1000, cpis, cmus, ccovs*IS_tilt, shuffle=false)
         
         ν_W = log_f(ν_S) - gmm_llh(ν_S, 1, cpis, cmus, ccovs*IS_tilt);
-        ν_W = fastexp.(ν_W);
-        @noopwhen (nodisp || i > 5) ax = axs[(i ÷ 2) + 1, (i % 2)+1]
+        ν_W = fastexp.(ν_W[:]);
+        @noopwhen (nodisp || i > 5) display(reduce(hcat, [log_f(ν_S), gmm_llh(ν_S, 1, cpis, cmus, ccovs*IS_tilt), ν_W]))
+        @noopwhen (nodisp || i > 5) ax = axs[i, 1]
         @noopwhen (nodisp || i > 5) plot_is_vs_target(ν_S, ν_W, ax=ax);
-        @noopwhen (nodisp || i > 5) for j = 1:6 ax[:plot](splat(gaussian_2D_level_curve(cmus[j,:], ccovs[:,:,j]))...); end
-        @noopwhen (nodisp || i > 5) axs[i, 3][:scatter](splat(ν_S)..., alpha=0.2);
+        @noopwhen (nodisp || i > 5) for j = 1:k ax[:plot](splat(gaussian_2D_level_curve(cmus[j,:], ccovs[:,:,j]))...); end
+        @noopwhen (nodisp || i > 5) axs[i, 2][:scatter](splat(ν_S)..., alpha=0.2);
+        # display(ν_W)
+        # display(ν_S)
     end
     return ν_S, ν_W, cpis, cmus, ccovs
 end
@@ -582,10 +701,12 @@ function combined_smcs(f_log_beta, f_log_target, opts)
 		betas=ais_betas, test=diagnostics, grad_delta=gris_grad_delta, burnin=gris_burnin,
 		prior_std=prior_std)
 
-    S, W = smcs_grad(gris_epochs, gris_nsmp, f_log_beta, opts=gris_opts)
-    S, W, pi, mu, cov = AMIS(S, W, amis_kcls, f_log_target, epochs=amis_epochs, nodisp=!diagnostics);
-    S, W = GMM_IS(5000, pi, mu, cov, f_log_target)
+    @time S, W = smcs_grad(gris_epochs, gris_nsmp, f_log_beta, opts=gris_opts)
+    @time S, W, pi, mu, cov = AMIS(S, W, amis_kcls, f_log_target, epochs=amis_epochs, nodisp=!diagnostics);
+    @time S, W = GMM_IS(gmm_smp, pi, mu, cov, f_log_target)
 
     return S, W, [pi, mu, cov]
 end
 
+
+end
