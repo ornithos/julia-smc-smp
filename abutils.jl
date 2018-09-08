@@ -108,6 +108,39 @@ function num_grad(fn, X, h=1e-8; verbose=true)
 end
 
 
+function num_grad_spec(fn, X, cart_ix, h=1e-8; verbose=true)
+    """
+    As per num_grad, but specifying a Cartesian Index ('cart_ix').
+    Thus a n(fn output) x 1 array will always be returned. At
+    some point it makes sense to roll this into my base numgrad, but
+    I don't want to yet as it complicates things.
+    """
+    shp = size(X)
+    resize_x = ndims(X) > 1
+    rm_xdim = isa(X, Real)
+    n = length(X)
+
+    f_x = fn(X)
+    if isa(f_x, Real)
+        im_f_shp = 0
+        resize_y = false
+    else
+        im_f_shp = size(f_x)
+        resize_y = !(ndims(f_x) <= 2 && any(im_f_shp .== 1))
+        @assert ndims(f_x) <= 2 "image of fn is tensor. Not supported."
+    end
+        
+    m = Int64(prod(max.(im_f_shp, 1)))
+
+    g = zeros(m, 1)
+    Xplus = convert(Array{Float64}, copy(X))
+    Xplus[cart_ix] += h
+    Xplus = reshape(Xplus, shp)
+    g = (fn(Xplus) - f_x) ./ h
+
+    return g
+end
+
 # ==================================================================================
 
 
@@ -199,6 +232,7 @@ _cmapc = [ 0.12156863  0.46666667  0.70588235  1.     ;
            0.17254902  0.62745098  0.17254902  1.        ;
            0.83921569  0.15294118  0.15686275  1.        ]
 tab10(i, a) = begin tmp = _cmapc[i, :]; tmp[end] = a; return tmp end
+
 
 
 end
