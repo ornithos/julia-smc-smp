@@ -358,6 +358,16 @@ end
 end
 
 
+ENABLE_TIMINGS = false
+
+macro mytimeit(exprs...)
+    if ENABLE_TIMINGS
+        return :(@timeit($(esc.(exprs)...)))
+    else
+        return esc(exprs[end])
+    end
+end
+
 function smcs_grad(epochs, n_samples, log_f; opts=smcs_opt())
     @assert opts.burnin < epochs
     @assert isa(opts, smcs_opt)
@@ -366,53 +376,55 @@ function smcs_grad(epochs, n_samples, log_f; opts=smcs_opt())
     @unpack test, resample_every, sqrtdelta, grad_delta = opts
     δ = grad_delta
     n_β = length(opts.betas)
-    n_β > opts.burnin && println("WARNING: BURN IN SHORTER THAN ANNEALING TIME")
+#     n_β > opts.burnin && println("WARNING: BURN IN SHORTER THAN ANNEALING TIME")
         
     S = zeros(n_samples*epochs, 2)
     W = zeros(n_samples*epochs)
     Wfinal = zeros(n_samples*epochs)
     
     # Make initial proposal from prior
-    μ_init = [0 0]'
+    μ_init = [0. 0.]'    
     x = randn(n_samples, 2) .* opts.prior_std .+ μ_init'
-#     S[1:n_samples,:] = x
+    S[1:n_samples,:] = x
     
-    @noopwhen !test f, axs = PyPlot.subplots(13,3, figsize=(10,22))
+    @noopwhen !test f, axs = PyPlot.subplots(16,3, figsize=(10,22))
     @noopwhen !test axs[1,1][:scatter](splat(x)...)
     @noopwhen !test plot_is_vs_target(S[1:n_samples,:], exp.(W[1:n_samples]), ax=axs[1,2])
     @noopwhen !test display(reduce(hcat, [S[1:n_samples,1], S[1:n_samples,2], W[1:n_samples], log_f(x, opts.betas[1])[1]]))
     
     # ===> GRIS LOOP <====
+    dbg_ax_ii = 2
     for t = range(1, stop=epochs)
         
-        nodisp = (!test || t>12)
+        nodisp = !(test && (t<12 || t ∈ [19,20,25, 35]))
         β = opts.betas[min(t, n_β)]
         
-        @noopwhen nodisp axs[t+1,1][:scatter](splat(x)...)
+        @noopwhen nodisp axs[dbg_ax_ii,1][:scatter](splat(x)...)
         
         # get gradient / Langevin proposal
         # --- calculate gradient ---
-        η = eta_t(t)  
-        x_track = param(x)
-        lp = log_f(x_track, 1.)[1]   # also spits out just log_f in second retval (a.o.to beta mix)
-        Tracker.back!(sum(lp))
-        
+        @mytimeit to "grad" begin
+            η = eta_t(t)
+            x_track = param(x)
+            @mytimeit to "fwd" lp = log_f(x_track, 1.)[1]   # also spits out just log_f in second retval (a.o.to beta mix)
+            @mytimeit to "back" Tracker.back!(sum(lp))
+        end
         c_mus = x .+ δ.*η .* x_track.grad
         # --------------------------
 
-        @noopwhen nodisp axs[t+1,2][:scatter](splat(c_mus)...)
+        @noopwhen nodisp axs[dbg_ax_ii,2][:scatter](splat(c_mus)...)
         
         # Sample from proposal
         xprime = c_mus .+ sqrtdelta*randn(n_samples, 2)
-        @noopwhen nodisp axs[t+1,3][:scatter](splat(xprime)...)
+        @noopwhen nodisp axs[dbg_ax_ii,3][:scatter](splat(xprime)...)
         
         # calculate importance weight
-        begin
+        @mytimeit to "impwt" begin
             dist_metric = sq_diff_matrix(xprime, c_mus) ./ (2*sqrtdelta^2)
-            lq_u = logsumexprows(-dist_metric) .- log(Float64(n_samples)) .- 0.5*2*log(2*pi*sqrtdelta^2)
+            lq_u = logsumexprows(-dist_metric) .- log(n_samples) .- 0.5*2*log(2*pi*sqrtdelta^2)
             
             @noopwhen true begin
-                lq_u2 = logsumexprows(-dist_metric) .- log(Float64(n_samples)) .- 0.5*log(det(2*pi*sqrtdelta^2 * eye(2)))
+                lq_u2 = logsumexprows(-dist_metric) .- log(n_samples) .- 0.5*log(det(2*pi*sqrtdelta^2 * eye(2)))
                 q_n = mapslices(x -> [mean([pdf(MvNormal(c_mus[i,:], sqrtdelta^2*eye(2)), x) 
                                       for i in 1:n_samples])], xprime, dims=2)
                 print(unique(map(x->round(x, digits=5), exp.(lq_u2) ./exp.(lq_u))))   # ratio to exact quick calc
@@ -429,7 +441,7 @@ function smcs_grad(epochs, n_samples, log_f; opts=smcs_opt())
         W[1+n_samples*(t-1):n_samples*t] = w
         Wfinal[1+n_samples*(t-1):n_samples*t] = lp .- lq_u
         
-        if t % resample_every == 0
+        @mytimeit to "rsmp" if t % resample_every == 0
             # RESAMPLE
             begin
                 min_rng = 1 + max(0, n_samples*t-1200)
@@ -442,6 +454,8 @@ function smcs_grad(epochs, n_samples, log_f; opts=smcs_opt())
         else
             x = xprime
         end
+        
+        @noopwhen nodisp dbg_ax_ii += 1
     end
     
     if opts.burnin > 0
@@ -449,7 +463,7 @@ function smcs_grad(epochs, n_samples, log_f; opts=smcs_opt())
         S = S[ix_start:end, :]; W = Wfinal[ix_start:end]
     end
     
-    return S, fastexp.(W)
+    return S, W
 end
 
 
@@ -457,7 +471,7 @@ end
 #    AMIS
 # ===================================================================================================================
 
-function gmm_llh(X, weights, pis, mus, sigmas)
+function gmm_llh(X, weights, pis, mus, sigmas; disp=false)
     n, p = size(X)
     k = length(pis)
     thrsh_comp = 0.005
@@ -469,6 +483,10 @@ function gmm_llh(X, weights, pis, mus, sigmas)
             bypass=inactive_ixs[j]) .+ log(pis[j])
     end
     P .*= weights
+    if disp
+        display(P)
+        display(logsumexprows(P))
+    end
     return logsumexprows(P)
 end
 
@@ -494,7 +512,7 @@ function log_gauss_llh(X, mu, sigma; bypass=false)
         retval = try _log_gauss_llh(X, mu, sigma)
             catch e
                 return -ones(size(X, 1))*Inf
-        	end
+            end
         return retval
     end
 end
@@ -519,7 +537,7 @@ function gmm_custom(X, weights, pi_prior, mu_prior, cov_prior; max_iter=100, tol
     mus = copy(mu_prior)
     sigmas = copy(cov_prior)
     
-    weights = weights / mean(weights)   # diff. to Cappé et al. due to prior
+    weights = weights / mean(weights)    # diff. to Cappé et al. due to prior
     
     thrsh_comp = 0.005
     inactive_ixs = pi_prior[:] .< thrsh_comp
@@ -546,8 +564,8 @@ function gmm_custom(X, weights, pi_prior, mu_prior, cov_prior; max_iter=100, tol
         inactive_ixs = Ns[:] .< 1
         active_ixs = logical_not(inactive_ixs)  # can't find a native NOT for BitArrays in Julia
         if any(inactive_ixs)
-            pis[inactive_ixs] .= 0.
-            pi_prior[inactive_ixs] .= 0.
+            pis[inactive_ixs] .= 0.0
+            pi_prior[inactive_ixs] .= 0.0
         end
         pis = Ns[:] + pi_prior[:]
         
@@ -572,13 +590,13 @@ end
 
 function sample_from_gmm(n, pis, mus, covs; shuffle=true)
     k, p = size(mus)
-    Ns = rand(Multinomial(n, pis[:]))
-    active_ixs = findall(Ns[:] .>= 1)
+    @mytimeit to "multinomial"  Ns = rand(Multinomial(n, pis[:]))
+    @mytimeit to "active" active_ixs = findall(Ns[:] .>= 1)
     
-    ixs = hcat(vcat(1, 1 .+ cumsum(Ns[1:end-1], dims=1)), cumsum(Ns, dims=1))
+    @mytimeit to "findixs" ixs = hcat(vcat(1, 1 .+ cumsum(Ns[1:end-1], dims=1)), cumsum(Ns, dims=1))
     out = zeros(n, p)
     for j=active_ixs
-        out[ixs[j,1]:ixs[j,2],:] = rand(MvNormal(mus[j,:], covs[:,:,j]), Ns[j])'
+        @mytimeit to "MvNorm rand" out[ixs[j,1]:ixs[j,2],:] = rand(MvNormal(mus[j,:], covs[:,:,j]), Ns[j])'
     end
     if shuffle
         out = out[randperm(n),:]
@@ -591,16 +609,17 @@ end
     epochs::Int64 = 5 
     nodisp::Bool = true
     gmm_smps::Int64 = 1000
+    IS_tilt::Float64 = 1.
 end
 
 
 
-function AMIS(S, W, k, log_f; kwargs...)
-	@unpack_amis_opt amis_opt(kwargs...)
-    IS_tilt = 2.0
+function AMIS(S, logW, k, log_f; kwargs...)
+    @unpack_amis_opt reconstruct(amis_opt(), kwargs)
     n, p = size(S)
     
     begin
+    W = softmax2(logW, dims=1)
     km = kmeans(copy(S'), k, weights=W)
     
     cmus = zeros(k,2)
@@ -609,22 +628,22 @@ function AMIS(S, W, k, log_f; kwargs...)
         ixs = findall(x -> isequal(x,i), km.assignments)
         cX = S[ixs, :]; cw = ProbabilityWeights(W[ixs])
         cmus[i,:] = cX' * cw/cw.sum
-        ccovs[:,:,i] = cov(cX, cw, corrected=true)
+        ccovs[:,:,i] = StatsBase.cov(cX, cw, corrected=true)
     end
 
     cpis = zeros(k)
     cnts = countmap(km.assignments)
     for i in 1:k
-    	try
-    		cpis[i] = cnts[i]/10
-    	catch e
-    		@warn "Cluster $i has no assigned points."
-    	end
+        try
+            cpis[i] = cnts[i]/10
+        catch e
+            @warn "Cluster $i has no assigned points."
+        end
     end
     
     if !nodisp
         f, axs = PyPlot.subplots(5,3, figsize=(8,12))
-        plot_is_vs_target(S, W, ax=axs[1,1])
+        plot_is_vs_target(S, W, ax=axs[1,1], c_num=7)
 
 #         plot_level_curves_all(mus, UTs, ax=axs[1,1], color="red")
         for i = 1:k
@@ -643,9 +662,9 @@ function AMIS(S, W, k, log_f; kwargs...)
         
         ν_W = log_f(ν_S) - gmm_llh(ν_S, 1, cpis, cmus, ccovs*IS_tilt);
         ν_W = fastexp.(ν_W[:]);
-        @noopwhen (nodisp || i > 5) display(reduce(hcat, [log_f(ν_S), gmm_llh(ν_S, 1, cpis, cmus, ccovs*IS_tilt), ν_W]))
+#         @noopwhen (nodisp || i > 5) display(reduce(hcat, [log_f(ν_S), gmm_llh(ν_S, 1, cpis, cmus, ccovs*IS_tilt), ν_W]))
         @noopwhen (nodisp || i > 5) ax = axs[i, 1]
-        @noopwhen (nodisp || i > 5) plot_is_vs_target(ν_S, ν_W, ax=ax);
+        @noopwhen (nodisp || i > 5) plot_is_vs_target(ν_S, ν_W, ax=ax, c_num=7);
         @noopwhen (nodisp || i > 5) for j = 1:k ax[:plot](splat(gaussian_2D_level_curve(cmus[j,:], ccovs[:,:,j]))...); end
         @noopwhen (nodisp || i > 5) axs[i, 2][:scatter](splat(ν_S)..., alpha=0.2);
         # display(ν_W)
@@ -656,15 +675,14 @@ end
 
 function GMM_IS(n, pis, mus, covs, log_f)
     S = sample_from_gmm(n, pis, mus, covs, shuffle=false)
-    W = log_f(S) - gmm_llh(S, 1, pis, mus, covs);
-    return S, fastexp.(W);
+    W = log_f(S) - gmm_llh(S, 1., pis, mus, covs, disp=false);
+    return S, W;
 end
 
 
 # ===================================================================================================================
 #    COMBINED SMC SAMPLER
 # ===================================================================================================================
-
 
 @with_kw struct smcs_opt
     resample_every::Int64 = 1 
@@ -676,6 +694,7 @@ end
     n_init::Int64 = 1000
     prior_std::Float64 = 10.
 end
+
 
 @with_kw struct csmcs_opt
     prior_std::Float64 = 10.
@@ -689,24 +708,24 @@ end
     gris_nsmp::Int64 = 50
     amis_kcls::Int64 = 6
     amis_epochs::Int64 = 30
+    amis_smp::Int64 = 1500
     gmm_smp::Int64 = 5000
     gmm_tilt::Float64 = 2.
 end
 
+
 function combined_smcs(f_log_beta, f_log_target, opts)
 
-	@assert isa(opts, csmcs_opt)
-	@unpack_csmcs_opt opts
-	gris_opts = smcs_opt(resample_every=gris_rsmp_every, sqrtdelta=gris_sqrtdelta,
-		betas=ais_betas, test=diagnostics, grad_delta=gris_grad_delta, burnin=gris_burnin,
-		prior_std=prior_std)
+    @unpack_csmcs_opt opts
+    gris_opts = smcs_opt(resample_every=gris_rsmp_every, sqrtdelta=gris_sqrtdelta,
+        betas=ais_betas, test=diagnostics, grad_delta=gris_grad_delta, burnin=gris_burnin,
+        prior_std=prior_std)
+    @mytimeit to "gris" S, logW = smcs_grad(gris_epochs, gris_nsmp, f_log_beta, opts=gris_opts)
+    @mytimeit to "amis" S, W, pi, mu, cov = AMIS(S, logW, amis_kcls, f_log_target, epochs=amis_epochs, 
+        nodisp=!diagnostics, gmm_smps=amis_smp, IS_tilt=gmm_tilt)
+    @mytimeit to "finalsmp" S, logW = GMM_IS(gmm_smp, pi, mu, cov, f_log_target)
 
-    @time S, W = smcs_grad(gris_epochs, gris_nsmp, f_log_beta, opts=gris_opts)
-    @time S, W, pi, mu, cov = AMIS(S, W, amis_kcls, f_log_target, epochs=amis_epochs, nodisp=!diagnostics);
-    @time S, W = GMM_IS(gmm_smp, pi, mu, cov, f_log_target)
-
-    return S, W, [pi, mu, cov]
+    return S, logW, [pi, mu, cov]
 end
-
 
 end
