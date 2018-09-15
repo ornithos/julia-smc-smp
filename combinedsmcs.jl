@@ -199,6 +199,13 @@ function softmax2(logp; dims=2)
     return p
 end
 
+function softmax_and_logsumexp(logp; dims=2)
+	u = maximum(logp, dims=dims)
+    p = exp.(logp .- u)
+    normc = sum(p, dims=dims)
+    p ./= normc
+    return p, normc + u
+end
 
 function sq_diff_matrix(X, Y)
     """
@@ -265,87 +272,6 @@ function eta_t(t)
 end
 
 
-
-function gradient_importance_sample_gauss(epochs, n_samples, log_f; burnin=0, test=true, prior_std=10.)
-    @assert burnin < epochs
-    
-    sqrtdelta = 1
-    S = zeros(n_samples*epochs, 2)
-    W = zeros(n_samples*epochs)
-    
-    # Make initial proposal from prior
-    μ_init = [0 0]'
-    x = randn(n_samples, 2) .* prior_std .+ μ_init'
-    S[1:n_samples,:] = x
-    
-    # ... allow for resampling of all (in principle)
-    W[1:n_samples] .= 1
-    
-    @noopwhen !test f, axs = PyPlot.subplots(11,3, figsize=(10,20))
-    @noopwhen !test axs[1,1][:scatter](splat(x)...)
-    @noopwhen !test plot_is_vs_target(S[1:n_samples,:], exp.(W[1:n_samples]), ax=axs[1,2])
-    @noopwhen !test display(reduce(hcat, [S[1:n_samples,1], S[1:n_samples,2], W[1:n_samples], log_f(x)[1]]))
-    
-    # ===> GRIS LOOP <====
-    for t = range(1, stop=epochs)
-        
-        nodisp = (!test || t>10)
-        # sample previous particles for this epoch
-        begin
-            min_rng = 1 + max(0, n_samples*t-1200)
-            max_rng = n_samples*max(1, t-1)
-            ixs = smp_from_logprob(n_samples, W[min_rng:max_rng])  .+ min_rng .- 1
-        end
-        
-        x = S[ixs,:]
-        
-        @noopwhen nodisp axs[t+1,1][:scatter](splat(x)...)
-        
-        # get gradient / Langevin proposal
-        # --- calculate gradient ---
-        η = eta_t(t)  
-        x_track = param(x)
-        lp = log_f(x_track)[1]
-        Tracker.back!(sum(lp))
-        
-        c_mus = x .+ 0.0.*η .* x_track.grad
-        # --------------------------
-        
-        # Sample from proposal
-        xprime = c_mus .+ sqrtdelta*randn(n_samples, 2)
-        @noopwhen nodisp axs[t+1,3][:scatter](splat(xprime)...)
-        
-        # calculate importance weight
-        begin
-            dist_metric = sq_diff_matrix(xprime, c_mus) ./ (2*sqrtdelta^2)
-            lq_u = logsumexprows(-dist_metric) .- log(Float64(n_samples)) .- 0.5*2*log(2*pi*sqrtdelta^2)
-            
-            @noopwhen !test begin
-                lq_u2 = logsumexprows(-dist_metric) .- log(Float64(n_samples)) .- 0.5*log(det(2*pi*sqrtdelta^2 * eye(2)))
-                q_n = mapslices(x -> [mean([pdf(MvNormal(c_mus[i,:], sqrtdelta^2*eye(2)), x) 
-                                      for i in 1:n_samples])], xprime, dims=2)
-                print(unique(map(x->round(x, digits=5), exp.(lq_u2) ./exp.(lq_u))))   # ratio to exact quick calc
-                println(unique(map(x->round(x, digits=5), q_n ./exp.(lq_u))))  # ratio to built-in Julia MVN
-            end
-                         
-            w = log_f(xprime)[1] .- lq_u  # may be able to get rid of f_log_target if we resample as in Schuster
-                                            # i.e. calculate in the gradient block in next iter.
-        end
-        
-        # Store particles / weights
-        S[1+n_samples*(t-1):n_samples*t, :] = xprime
-        W[1+n_samples*(t-1):n_samples*t] = w
-    end
-    
-    if burnin > 0
-        S = S[n_samples*burnin+1:end, :]; W = W[n_samples*burnin+1:end]
-    end
-    
-    return S, fastexp.(W)
-end
-
-
-
 @with_kw struct smcs_opt
     resample_every::Int64 = 1 
     sqrtdelta::Float64 =1.
@@ -368,23 +294,25 @@ macro mytimeit(exprs...)
     end
 end
 
-function smcs_grad(epochs, n_samples, log_f; opts=smcs_opt())
+function smcs_grad(epochs, n_samples, log_f; d=2, opts=smcs_opt())
     @assert opts.burnin < epochs
     @assert isa(opts, smcs_opt)
     @assert epochs % opts.resample_every == 0 "epochs should be a multiple of the resampling points"
     
     @unpack test, resample_every, sqrtdelta, grad_delta = opts
+    @assert d == 2 || !test "test option only available when d=2."
+
     δ = grad_delta
     n_β = length(opts.betas)
 #     n_β > opts.burnin && println("WARNING: BURN IN SHORTER THAN ANNEALING TIME")
         
-    S = zeros(n_samples*epochs, 2)
+    S = zeros(n_samples*epochs, d)
     W = zeros(n_samples*epochs)
     Wfinal = zeros(n_samples*epochs)
     
     # Make initial proposal from prior
-    μ_init = [0. 0.]'    
-    x = randn(n_samples, 2) .* opts.prior_std .+ μ_init'
+    μ_init = zeros(1, d)    
+    x = randn(n_samples, d) .* opts.prior_std .+ μ_init
     S[1:n_samples,:] = x
     
     @noopwhen !test f, axs = PyPlot.subplots(16,3, figsize=(10,22))
@@ -415,16 +343,16 @@ function smcs_grad(epochs, n_samples, log_f; opts=smcs_opt())
         @noopwhen nodisp axs[dbg_ax_ii,2][:scatter](splat(c_mus)...)
         
         # Sample from proposal
-        xprime = c_mus .+ sqrtdelta*randn(n_samples, 2)
-        @noopwhen nodisp axs[dbg_ax_ii,3][:scatter](splat(xprime)...)
+        xprime = c_mus .+ sqrtdelta*randn(n_samples, d)
+        @noopwhen nodisp axs[dbg_ax_ii, 3][:scatter](splat(xprime)...)
         
         # calculate importance weight
         @mytimeit to "impwt" begin
             dist_metric = sq_diff_matrix(xprime, c_mus) ./ (2*sqrtdelta^2)
-            lq_u = logsumexprows(-dist_metric) .- log(n_samples) .- 0.5*2*log(2*pi*sqrtdelta^2)
+            lq_u = logsumexprows(-dist_metric) .- log(n_samples) .- 0.5*d*log(2*pi*sqrtdelta^2)
             
             @noopwhen true begin
-                lq_u2 = logsumexprows(-dist_metric) .- log(n_samples) .- 0.5*log(det(2*pi*sqrtdelta^2 * eye(2)))
+                lq_u2 = logsumexprows(-dist_metric) .- log(n_samples) .- 0.5*log(det(2*pi*sqrtdelta^2 * eye(d)))
                 q_n = mapslices(x -> [mean([pdf(MvNormal(c_mus[i,:], sqrtdelta^2*eye(2)), x) 
                                       for i in 1:n_samples])], xprime, dims=2)
                 print(unique(map(x->round(x, digits=5), exp.(lq_u2) ./exp.(lq_u))))   # ratio to exact quick calc
@@ -579,8 +507,8 @@ function gmm_custom(X, weights, pi_prior, mu_prior, cov_prior; max_iter=100, tol
             Δx = X .- mus[j, :]'
             Δμ = (mus[j,:] - mu_prior[j,:])'
             sigmas[:,:,j] = (Δx.*rs[:,j])'Δx + pi_prior[j]*(Δμ'Δμ + cov_prior[:,:,j])
-            sigmas[:,:,j] ./= (Ns[j] + pi_prior[j] + p + 2)
-            sigmas[:,:,j] = (sigmas[:,:,j] + sigmas[:,:,j]')/2 + eye(2)*1e-6
+            sigmas[:,:,j] ./= (Ns[j] + pi_prior[j] + p + 2)     # normalizing terms from Wishart prior
+            sigmas[:,:,j] = (sigmas[:,:,j] + sigmas[:,:,j]')/2 + eye(p)*1e-6   # hack: prevent collapse
         end
 
     end
@@ -622,8 +550,8 @@ function AMIS(S, logW, k, log_f; kwargs...)
     W = softmax2(logW, dims=1)
     km = kmeans(copy(S'), k, weights=W)
     
-    cmus = zeros(k,2)
-    ccovs = zeros(2,2,k)
+    cmus = zeros(k, p)
+    ccovs = zeros(p, p,k)
     for i in range(1, stop=k)
         ixs = findall(x -> isequal(x,i), km.assignments)
         cX = S[ixs, :]; cw = ProbabilityWeights(W[ixs])
@@ -714,13 +642,13 @@ end
 end
 
 
-function combined_smcs(f_log_beta, f_log_target, opts)
+function combined_smcs(f_log_beta, f_log_target, opts; d=2)
 
     @unpack_csmcs_opt opts
     gris_opts = smcs_opt(resample_every=gris_rsmp_every, sqrtdelta=gris_sqrtdelta,
         betas=ais_betas, test=diagnostics, grad_delta=gris_grad_delta, burnin=gris_burnin,
         prior_std=prior_std)
-    @mytimeit to "gris" S, logW = smcs_grad(gris_epochs, gris_nsmp, f_log_beta, opts=gris_opts)
+    @mytimeit to "gris" S, logW = smcs_grad(gris_epochs, gris_nsmp, f_log_beta, d=d, opts=gris_opts)
     @mytimeit to "amis" S, W, pi, mu, cov = AMIS(S, logW, amis_kcls, f_log_target, epochs=amis_epochs, 
         nodisp=!diagnostics, gmm_smps=amis_smp, IS_tilt=gmm_tilt)
     @mytimeit to "finalsmp" S, logW = GMM_IS(gmm_smp, pi, mu, cov, f_log_target)

@@ -1,6 +1,7 @@
 module abplot
 
 using PyPlot
+using Flux: Tracker
 include("./abutils.jl")
 
 function _gen_cube_grid(vmin, vmax; nsmp_dim=8, ndim=2, force=false)
@@ -81,7 +82,7 @@ function plot_2dtile_imshow(forward_network; nsmp_dim=8, scale=2., xrng=nothing,
     
     zs = _gen_grid(xrng, yrng, nsmp_dim=nsmp_dim)
     tr = (transpose == true ? Base.transpose : x -> x)
-    ims = [reshape(forward_network(zs[ii,:]).data, im_shp) for ii in 1:size(zs,1)]
+    ims = [reshape(Tracker.data(forward_network(zs[ii,:])), im_shp) for ii in 1:size(zs,1)]
     imtiled = tr(_tile_image_grid(ims))
     ax = ax == nothing ? gca() : ax
     ax[:imshow](imtiled, cmap=cmap)
