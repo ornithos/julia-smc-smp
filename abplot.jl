@@ -93,4 +93,58 @@ function plot_2dtile_imshow(forward_network; nsmp_dim=8, scale=2., xrng=nothing,
     return ax
 end
 
+
+function ax_lim_one_side(ax, xy; limstart=nothing, limend=nothing, type="constant")
+    if xy == "x"
+        lims = ax[:get_xlim]()
+    else
+        lims = ax[:get_ylim]()
+    end
+    lims = collect(lims)  # make mutable (is tuple typed)
+    
+    if type == "m" || type == "multiply" || type == "*"
+        f = *
+    elseif type == "a" || type == "add" || type == "+"
+        f = +
+    elseif type == "c" || type == "constant"
+        f = (x, y) -> y
+    else
+        throw("Unexpected limtype (expecting 'constant', 'add', 'multiply')")
+    end
+    
+    if limstart != nothing; lims[1] = f(lims[1], limstart); end
+    if limend != nothing; lims[2] = f(lims[2], limend); end
+    
+    if xy == "x"
+        ax[:set_xlim](lims)
+    else
+        ax[:set_ylim](lims)
+    end
+end
+
+
+# convenience wrappers for clean code
+function x_lim_one_side(ax; s=nothing, e=nothing, type="constant")
+    ax_lim_one_side(ax, "x", limstart=s, limend=e, type=type)
+end
+
+function y_lim_one_side(ax; s=nothing, e=nothing, type="constant")
+    ax_lim_one_side(ax, "y", limstart=s, limend=e, type=type)
+end
+
+
+function pairplot(X::AbstractArray{T, 2}; figsize=(10,10), alpha=0.5, bins=50) where T <: AbstractFloat
+    n, d = size(X)
+    (d > 20) && throw("will not plot for d > 20")
+
+    fig, axs = PyPlot.subplots(d, d, figsize=figsize)
+    for ix = 1:d, iy = 1:d
+        if ix != iy
+            axs[ix, iy][:scatter](X[:, ix], X[:, iy], alpha=alpha)
+        else
+            axs[ix, iy][:hist](X[:, ix], bins=bins)
+        end
+    end
+end
+
 end

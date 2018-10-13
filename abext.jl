@@ -59,30 +59,41 @@ BCE_unthreaded(X::TrackedArray, P::AbstractArray) = Tracker.track(BCE, X, P)
 end
 
 
-# Binary Cross Entropy
-function BCE(X, P)
-	@assert size(X) == size(P)
-    function col_bce(i)
-    	@views x_i = X[:,i]
-    	@views p_i = P[:,i]
-    	return -dot(x_i, log.(p_i .+ eps())) + dot(1 .- x_i, log.(1 .- p_i .+ eps()))
-    end
+# # Binary Cross Entropy
+# function BCE(X, P)
+# 	@assert size(X) == size(P)
+#     function col_bce(i)
+#     	@views x_i = X[:,i]
+#     	@views p_i = P[:,i]
+#     	return dot(x_i, log.(p_i .+ eps())) + dot(1 .- x_i, log.(1 .- p_i .+ eps()))
+#     end
 
-    return tmapreduce(col_bce, +, 0.0, 1:size(X,2))
-end
+#     return tmapreduce(col_bce, +, 0.0, 1:size(X,2))
+# end
 
-BCE(X::TrackedArray, P::TrackedArray) = Tracker.track(BCE, X, P)
-BCE(X::AbstractArray, P::TrackedArray) = Tracker.track(BCE, X, P)
-BCE(X::TrackedArray, P::AbstractArray) = Tracker.track(BCE, X, P)
+# function BCE(X, P)
+# 	@assert size(X) == size(P)
+#     function col_bce(i)
+#     	@views x_i = X[:,i]
+#     	@views p_i = P[:,i]
+#     	return dot(x_i, log.(p_i .+ eps())) + dot(1 .- x_i, log.(1 .- p_i .+ eps()))
+#     end
 
-∇P_BCE(X, P) = - (X - P) ./ ((P .+ eps()) .* (1 .- P .+ eps()))
-∇X_BCE(P) =  - (log.(P .+ eps()) - log.(1 .- P .+ eps()))
+#     return tmapreduce(col_bce, +, 0.0, 1:size(X,2))
+# end
 
-@grad function BCE(X, P)
-    return BCE(Tracker.data(X), Tracker.data(P)), Δ -> (Δ * ∇X_BCE(P), Δ * ∇P_BCE(X, P))
-end
+# BCE(X::TrackedArray, P::TrackedArray) = Tracker.track(BCE, X, P)
+# BCE(X::AbstractArray, P::TrackedArray) = Tracker.track(BCE, X, P)
+# BCE(X::TrackedArray, P::AbstractArray) = Tracker.track(BCE, X, P)
 
-binary_cross_entropy = BCE   # (alias)
+# ∇P_BCE(X, P) = - (X - P) ./ ((P .+ eps()) .* (1 .- P .+ eps()))
+# ∇X_BCE(P) =  - (log.(P .+ eps()) - log.(1 .- P .+ eps()))
+
+# @grad function BCE(X, P)
+#     return BCE(Tracker.data(X), Tracker.data(P)), Δ -> (Δ * ∇X_BCE(P), Δ * ∇P_BCE(X, P))
+# end
+
+# binary_cross_entropy = BCE   # (alias)
 
 
 
